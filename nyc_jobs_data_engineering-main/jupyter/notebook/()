@@ -1,0 +1,373 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import findspark\n",
+    "findspark.init()\n",
+    "\n",
+    "from pyspark.sql import SparkSession\n",
+    "from pyspark.sql import functions as F\n",
+    "from pyspark.sql.types import *\n",
+    "import matplotlib.pyplot as plt\n",
+    "from pyspark.sql.window import Window"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "spark = (\n",
+    "    SparkSession.builder\n",
+    "    .appName(\"pyspark-assessment\")\n",
+    "    .getOrCreate()\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "DATASET_READ_PATH = \"/dataset/nyc-jobs.csv\"\n",
+    "\n",
+    "# Assumptions for normalization\n",
+    "WORKING_DAYS_PER_YEAR = 260\n",
+    "WORKING_HOURS_PER_YEAR = 2080"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "jobs_raw_df = (\n",
+    "    spark.read\n",
+    "    .option(\"header\", True)\n",
+    "    .option(\"inferSchema\", True)\n",
+    "    .csv(DATASET_READ_PATH)\n",
+    ")\n",
+    "\n",
+    "jobs_raw_df.printSchema()\n",
+    "jobs_raw_df.show(5)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "jobs_raw_df.describe().show()\n",
+    "\n",
+    "jobs_raw_df.groupBy(\"Job Category\") \\\n",
+    "    .count() \\\n",
+    "    .orderBy(F.desc(\"count\")) \\\n",
+    "    .show(10)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_salary_frequency(df):\n",
+    "    rows = df.select(\"Salary Frequency\").distinct().collect()\n",
+    "    return [r[\"Salary Frequency\"] for r in rows]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mock_data = [('A', 'Annual'), ('B', 'Daily')]\n",
+    "schema = ['id', 'Salary Frequency']\n",
+    "\n",
+    "mock_df = spark.createDataFrame(mock_data, schema)\n",
+    "assert get_salary_frequency(mock_df) == ['Annual', 'Daily']"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "clean_df = (\n",
+    "    jobs_raw_df\n",
+    "    .withColumn(\"salary_from\", F.col(\"Salary Range From\").cast(\"double\"))\n",
+    "    .withColumn(\"salary_to\", F.col(\"Salary Range To\").cast(\"double\"))\n",
+    "    .withColumn(\"salary_freq\", F.upper(F.trim(F.col(\"Salary Frequency\"))))\n",
+    "    .withColumn(\"agency\", F.trim(F.col(\"Agency\")))\n",
+    "    .withColumn(\"job_category\", F.trim(F.col(\"Job Category\")))\n",
+    "    .filter(F.col(\"salary_from\").isNotNull())\n",
+    "    .filter(F.col(\"salary_to\") >= F.col(\"salary_from\"))\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "salary_multiplier = F.when(F.col(\"salary_freq\") == \"ANNUAL\", 1) \\\n",
+    "                     .when(F.col(\"salary_freq\") == \"DAILY\", WORKING_DAYS_PER_YEAR) \\\n",
+    "                     .when(F.col(\"salary_freq\") == \"HOURLY\", WORKING_HOURS_PER_YEAR) \\\n",
+    "                     .otherwise(None)\n",
+    "\n",
+    "fe_df = clean_df.withColumn(\n",
+    "    \"salary_annual\",\n",
+    "    ((F.col(\"salary_from\") + F.col(\"salary_to\")) / 2) * salary_multiplier\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "fe_df = (\n",
+    "    fe_df\n",
+    "    .withColumn(\n",
+    "        \"salary_band\",\n",
+    "        F.when(F.col(\"salary_annual\") >= 150000, \"HIGH\")\n",
+    "         .when(F.col(\"salary_annual\") >= 80000, \"MEDIUM\")\n",
+    "         .otherwise(\"LOW\")\n",
+    "    )\n",
+    "    .withColumn(\n",
+    "        \"requires_degree\",\n",
+    "        F.when(\n",
+    "            F.col(\"Minimum Qual Requirements\")\n",
+    "            .rlike(\"Bachelor|Master|PhD\"), 1\n",
+    "        ).otherwise(0)        \n",
+    "    )\n",
+    "    .withColumn(\n",
+    "        \"posting_year\",\n",
+    "        F.year(F.col(\"Posting Date\"))\n",
+    "    )\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "kpi_job_category_counts_df = (\n",
+    "    fe_df\n",
+    "    .groupBy(\"job_category\")\n",
+    "    .agg(F.count(\"*\").alias(\"posting_count\"))\n",
+    "    .orderBy(F.desc(\"posting_count\"))\n",
+    "    .limit(10)\n",
+    ")\n",
+    "\n",
+    "kpi_job_category_counts_df.show(truncate=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "kpi_salary_by_category_df = (\n",
+    "    fe_df\n",
+    "    .groupBy(\"job_category\")\n",
+    "    .agg(\n",
+    "        F.avg(\"salary_annual\").alias(\"avg_salary\"),\n",
+    "        F.min(\"salary_annual\").alias(\"min_salary\"),\n",
+    "        F.max(\"salary_annual\").alias(\"max_salary\")\n",
+    "    )\n",
+    "    .orderBy(F.desc(\"avg_salary\"))\n",
+    ")\n",
+    "\n",
+    "kpi_salary_by_category_df.show(truncate=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "kpi_degree_salary_df = (\n",
+    "    fe_df\n",
+    "    .groupBy(\"requires_degree\")\n",
+    "    .agg(\n",
+    "        F.count(\"*\").alias(\"job_count\"),\n",
+    "        F.avg(\"salary_annual\").alias(\"avg_salary\")\n",
+    "    )\n",
+    "    .orderBy(F.desc(\"avg_salary\"))\n",
+    ")\n",
+    "\n",
+    "kpi_degree_salary_df.show(truncate=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "window_agency_salary = Window.partitionBy(\"agency\").orderBy(F.desc(\"salary_annual\"))\n",
+    "\n",
+    "kpi_highest_salary_per_agency_df = (\n",
+    "    fe_df\n",
+    "    .withColumn(\"rank\", F.row_number().over(window_agency_salary))\n",
+    "    .filter(F.col(\"rank\") == 1)\n",
+    "    .select(\n",
+    "        \"agency\",\n",
+    "        \"Business Title\",\n",
+    "        \"salary_annual\"\n",
+    "    )\n",
+    "    .orderBy(F.desc(\"salary_annual\"))\n",
+    ")\n",
+    "\n",
+    "kpi_highest_salary_per_agency_df.show(10, truncate=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "kpi_avg_salary_last_2yrs_df = (\n",
+    "    fe_df\n",
+    "    .filter(F.col(\"posting_year\") >= (F.year(F.current_date()) - 2))\n",
+    "    .groupBy(\"agency\")\n",
+    "    .agg(\n",
+    "        F.count(\"*\").alias(\"job_count_last_2yrs\"),\n",
+    "        F.avg(\"salary_annual\").alias(\"avg_salary_last_2yrs\")\n",
+    "    )\n",
+    "    .orderBy(F.desc(\"avg_salary_last_2yrs\"))\n",
+    ")\n",
+    "\n",
+    "kpi_avg_salary_last_2yrs_df.show(10, truncate=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "skills = [\n",
+    "    \"python\", \"spark\", \"sql\", \"java\", \"aws\",\n",
+    "    \"hadoop\", \"scala\", \"etl\", \"tableau\", \"excel\"\n",
+    "]\n",
+    "\n",
+    "skill_kpi_dfs = []\n",
+    "\n",
+    "for skill in skills:\n",
+    "    df_skill = (\n",
+    "        fe_df\n",
+    "        .filter(F.lower(F.col(\"Preferred Skills\")).contains(skill))\n",
+    "        .groupBy()\n",
+    "        .agg(\n",
+    "            F.count(\"*\").alias(\"job_count\"),\n",
+    "            F.avg(\"salary_annual\").alias(\"avg_salary\")\n",
+    "        )\n",
+    "        .withColumn(\"skill\", F.lit(skill))\n",
+    "        .select(\"skill\", \"job_count\", \"avg_salary\")\n",
+    "    )\n",
+    "    skill_kpi_dfs.append(df_skill)\n",
+    "\n",
+    "from functools import reduce\n",
+    "kpi_highest_paid_skills_df = reduce(lambda a, b: a.union(b), skill_kpi_dfs)\n",
+    "\n",
+    "kpi_highest_paid_skills_df = (\n",
+    "    kpi_highest_paid_skills_df\n",
+    "    .orderBy(F.desc(\"avg_salary\"))\n",
+    ")\n",
+    "\n",
+    "kpi_highest_paid_skills_df.show(truncate=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pdf = kpi_job_category_counts_df.toPandas()\n",
+    "\n",
+    "plt.figure(figsize=(10,6))\n",
+    "plt.barh(pdf[\"job_category\"], pdf[\"posting_count\"])\n",
+    "plt.xlabel(\"Number of Job Postings\")\n",
+    "plt.title(\"Top 10 Job Categories\")\n",
+    "plt.gca().invert_yaxis()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "assert fe_df.filter(F.col(\"salary_annual\") < 0).count() == 0\n",
+    "assert fe_df.filter(F.col(\"agency\").isNull()).count() == 0"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# OUTPUT WRITE (DISABLED FOR LOCAL WINDOWS + DOCKER)\n",
+    "\n",
+    "DATASET_WRITE_PATH = \"/dataset/curated/nyc_jobs\"\n",
+    "\n",
+    "print(\"Curated output path:\", DATASET_WRITE_PATH)\n",
+    "\n",
+    "# NOTE:\n",
+    "# Spark overwrite operations fail on Windows Docker environments due to\n",
+    "# Hadoop filesystem permission constraints.\n",
+    "# This write executes successfully on Linux-based Spark clusters.\n",
+    "\n",
+    "# (\n",
+    "#     fe_df\n",
+    "#     .repartition(\"agency\")\n",
+    "#     .write\n",
+    "#     .mode(\"overwrite\")\n",
+    "#     .parquet(DATASET_WRITE_PATH)\n",
+    "# )"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print(\"Final curated dataset preview:\")\n",
+    "fe_df.select(\n",
+    "    \"agency\",\n",
+    "    \"job_category\",\n",
+    "    \"salary_annual\",\n",
+    "    \"requires_degree\",\n",
+    "    \"salary_band\",\n",
+    "    \"posting_year\"\n",
+    ").show(20, truncate=False)"
+   ]
+  }
+ ],
+ "metadata": {},
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
